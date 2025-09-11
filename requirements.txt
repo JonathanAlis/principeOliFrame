@@ -1,0 +1,11 @@
+numpy
+matplotlib
+moviepy
+librosa
+opencv-python
+mido
+pandas
+psola
+mido
+crepe
+tensorflow
