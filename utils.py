@@ -321,6 +321,8 @@ def create_clip(instrumento, midi_track, save_name, dur_mult=1,
             this_note = notes_sorted.head(3)
 
         with_eyes = this_note.dropna()
+        if len(with_eyes) == 0:
+            continue
         if not with_eyes.empty:
             this_note = with_eyes.sample(n=1)
         else:
@@ -420,3 +422,136 @@ def substituir_audio(video_path: str, audio_path: str, output_path: str,
 
 
 
+def create_clip_unrestricted(instrumento, midi_track, save_name, dur_mult=1,
+                imgshape='vertical', autotune=True, fade_duration=0.05,
+                pause_path=None):
+    """
+    Cria vídeo sequenciado a partir de notas.
+    
+    pause_path: caminho de uma imagem para preencher os tempos sem notas
+    """
+    # Carrega notas do instrumento
+    notas = pd.read_csv(Path('instruments')/Path(instrumento)/(instrumento+'.csv'))
+    instrument_col = [col for col in notas.columns if 'instruments' in col][0]
+
+    if imgshape == 'vertical':
+        target_aspect = 9 / 16
+    elif imgshape == 'horizontal':
+        target_aspect = 16 / 9
+    else:
+        target_aspect = 1
+    closest_to_target = np.inf
+    
+    source_vids = {}
+    for _, rows in notas.iterrows():
+        if rows[instrument_col] not in source_vids:
+            vid = VideoFileClip(rows[instrument_col])
+            width, height = vid.w, vid.h
+            source_vids[rows[instrument_col]] = vid
+            # video com aspect ratio mais proximo do alvo
+            if ((width/height) - float(target_aspect))**2 < closest_to_target:
+                closest_to_target = ((width/height) - target_aspect)**2
+                size = (width, height)
+    print(size)
+    if size[0]/size[1] > target_aspect:
+        size = (int(size[1]*target_aspect), size[1])
+    else:
+        size = (size[0], int(size[0]/target_aspect))
+    print("Target size:", size)
+        
+    print("Videos:", source_vids.keys())
+    
+    clips = []
+    intervals = []  # armazenar (start, end) de cada nota
+    
+    for i in range(len(midi_track['midi'])):
+        midi_note = midi_track['midi'][i]
+        freq = librosa.midi_to_hz(midi_note)
+
+        note_dur = midi_track['end'][i] - midi_track['start'][i]
+        while note_dur > 0.0:
+            this_note = notas.loc[notas['midi'] == midi_note]
+
+            if len(this_note) == 0:
+                print(f"missing note of midi {midi_note}, trying closest with dur >= {note_dur}")
+                this_note=notas.loc[notas['duracao'] >= note_dur].copy()
+                this_note['diff'] = np.abs(this_note['midi'] - midi_track['midi'][i])
+                notes_sorted = this_note.sort_values(by='diff')
+                this_note = notes_sorted.head(3)
+
+            with_eyes = this_note.dropna()
+            if len(with_eyes) == 0:
+                note_dur -= 0.05
+                continue
+            if not with_eyes.empty:
+                this_note = with_eyes.sample(n=1)
+            else:
+                this_note = this_note.sample(n=1)
+
+            this_note = this_note.iloc[0].to_dict()
+            source_start_time = this_note['inicio']*dur_mult
+            start_time = midi_track['start'][i]
+
+            source = this_note[f'instruments/{instrumento}']
+            note_clip = (source_vids[source]
+                        .subclipped(source_start_time, source_start_time + note_dur)
+                        .cropped(width=size[0], height=size[1], x_center=source_vids[source].w//2, y_center=source_vids[source].h//2)
+                        .with_start(start_time)
+                        .with_effects([afx.AudioFadeIn(fade_duration),
+                                        afx.AudioFadeOut(fade_duration)]))
+            
+            if autotune:
+                note_clip = autotune_clip(
+                    note_clip,
+                    target_midi=midi_note,
+                    source_midi=librosa.hz_to_midi(this_note['median freq'])
+                )
+            
+            clips.append(note_clip)
+            intervals.append((start_time, start_time + note_dur))
+            note_dur = 0.0  # sair do loop
+
+
+    # Adiciona pausas se o usuário forneceu imagem
+    image_path = pause_path
+    if image_path is not None and len(intervals) > 0:
+        intervals = sorted(intervals, key=lambda x: x[0])
+        all_start = intervals[0][0]
+        all_end = max(end for _, end in intervals)
+
+        # 🔹 Caso especial: se começa com espaço antes do primeiro clip
+        if all_start > 0:
+            orig_clip = ImageClip(load_image_corrected(image_path))
+            gap_clip = (ImageClip(load_image_corrected(image_path))
+                        .with_duration(all_start)   # do 0 até o primeiro início
+                        .with_start(0)
+                        .cropped(width=size[0], height=size[1], x_center=orig_clip.w//2, y_center=orig_clip.h//2)
+                        .resized(size))
+            clips.append(gap_clip)
+
+        current_time = all_start
+        for (start, end) in intervals:
+            if start > current_time:  # gap encontrado
+                gap_clip = (ImageClip(load_image_corrected(image_path))
+                            .with_duration(start - current_time)
+                            .with_start(current_time)
+                            .cropped(width=size[0], height=size[1], x_center=orig_clip.w//2, y_center=orig_clip.h//2)
+                            .resized(size))
+                clips.append(gap_clip)
+            current_time = max(current_time, end)
+
+        # Se sobrar espaço no final
+        if current_time < all_end:
+            gap_clip = (ImageClip(load_image_corrected(image_path))
+                        .with_duration(all_end - current_time)
+                        .with_start(current_time)
+                        .cropped(width=size[0], height=size[1], x_center=orig_clip.w//2, y_center=orig_clip.h//2)
+                        .resized(size))
+            clips.append(gap_clip)
+
+
+    print("Renderizando...")
+    cc = CompositeVideoClip(clips, size=size)
+    cc.write_videofile(save_name)
+
+    return
